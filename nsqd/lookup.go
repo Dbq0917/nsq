@@ -6,11 +6,19 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/nsqio/go-nsq"
 	"github.com/nsqio/nsq/internal/version"
 )
+
+// drainNotification is sent over notifyChan when the node begins its
+// graceful offload; lookupLoop unregisters all topics from nsqlookupd
+// and closes done once the announcements have been sent
+type drainNotification struct {
+	done chan struct{}
+}
 
 func connectCallback(n *NSQD, hostname string) func(*lookupPeer) {
 	return func(lp *lookupPeer) {
@@ -50,6 +58,13 @@ func connectCallback(n *NSQD, hostname string) func(*lookupPeer) {
 			n.logf(LOG_ERROR, "LOOKUPD(%s): no broadcast address", lp)
 		}
 
+		// a node that is offloading itself must not re-register its
+		// topics if the lookupd connection happens to reconnect
+		if n.IsDraining() {
+			n.logf(LOG_INFO, "LOOKUPD(%s): skipping registration, node is draining", lp)
+			return
+		}
+
 		// build all the commands first so we exit the lock(s) as fast as possible
 		var commands []*nsq.Command
 		n.RLock()
@@ -81,6 +96,9 @@ func (n *NSQD) lookupLoop() {
 	var lookupPeers []*lookupPeer
 	var lookupAddrs []string
 	connect := true
+
+	atomic.StoreInt32(&n.lookupLoopRunning, 1)
+	defer atomic.StoreInt32(&n.lookupLoopRunning, 0)
 
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -128,6 +146,27 @@ func (n *NSQD) lookupLoop() {
 			var branch string
 
 			switch val := val.(type) {
+			case drainNotification:
+				// the node is offloading itself: unregister every topic
+				// (which also removes its channel registrations) so that
+				// producers stop discovering this node
+				var commands []*nsq.Command
+				n.RLock()
+				for _, topic := range n.topicMap {
+					commands = append(commands, nsq.UnRegister(topic.name, ""))
+				}
+				n.RUnlock()
+				for _, lookupPeer := range lookupPeers {
+					for _, cmd := range commands {
+						n.logf(LOG_INFO, "LOOKUPD(%s): %s", lookupPeer, cmd)
+						_, err := lookupPeer.Command(cmd)
+						if err != nil {
+							n.logf(LOG_ERROR, "LOOKUPD(%s): %s - %s", lookupPeer, cmd, err)
+						}
+					}
+				}
+				close(val.done)
+				continue
 			case *Channel:
 				// notify all nsqlookupds that a new channel exists, or that it's removed
 				branch = "channel"

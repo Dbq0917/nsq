@@ -55,6 +55,10 @@ type Options struct {
 	ClientTimeout   time.Duration
 	MaxDeferTimeout time.Duration `flag:"max-defer-timeout"`
 
+	// graceful offload (drain) options
+	DrainMinWait time.Duration `flag:"drain-min-wait" cfg:"drain_min_wait"`
+	DrainMaxWait time.Duration `flag:"drain-max-wait" cfg:"drain_max_wait"`
+
 	// client overridable configuration options
 	MaxHeartbeatInterval   time.Duration `flag:"max-heartbeat-interval"`
 	MaxRdyCount            int64         `flag:"max-rdy-count"`
@@ -161,6 +165,9 @@ func NewOptions() *Options {
 		MaxReqTimeout:   1 * time.Hour,
 		ClientTimeout:   60 * time.Second,
 		MaxDeferTimeout: 1 * time.Hour,
+
+		DrainMinWait: 0,
+		DrainMaxWait: 30 * time.Second,
 
 		MaxHeartbeatInterval:   60 * time.Second,
 		MaxRdyCount:            2500,

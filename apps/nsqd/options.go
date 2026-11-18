@@ -163,6 +163,10 @@ func nsqdFlagSet(opts *nsqd.Options) *flag.FlagSet {
 	flagSet.Int64("max-body-size", opts.MaxBodySize, "maximum size of a single command body")
 	flagSet.Duration("max-defer-timeout", opts.MaxDeferTimeout, "maximum duration when deferring a message")
 
+	// graceful offload (drain) options
+	flagSet.Duration("drain-min-wait", opts.DrainMinWait, "minimum notification period after unregistering from lookupd before the node stops serving (should cover the producer lookup refresh interval)")
+	flagSet.Duration("drain-max-wait", opts.DrainMaxWait, "maximum time to wait for in-flight publishes to drain before shutting down")
+
 	// client overridable configuration options
 	flagSet.Duration("max-heartbeat-interval", opts.MaxHeartbeatInterval, "maximum client configurable duration of time between client heartbeats")
 	flagSet.Int64("max-rdy-count", opts.MaxRdyCount, "maximum RDY count for a client")

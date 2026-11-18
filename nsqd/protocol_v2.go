@@ -85,6 +85,20 @@ func (p *protocolV2) IOLoop(c protocol.Client) error {
 
 		p.nsqd.logf(LOG_DEBUG, "PROTOCOL(V2): [%s] %s", client, params)
 
+		// track publish commands as in-flight so that a draining node
+		// waits until their responses have been flushed before closing
+		// connections; the slot is held across Exec and Send
+		pubInFlight := false
+		if isPubCommand(params) {
+			pubInFlight = p.nsqd.beginPub()
+		}
+		endPub := func() {
+			if pubInFlight {
+				pubInFlight = false
+				p.nsqd.endPub()
+			}
+		}
+
 		var response []byte
 		response, err = p.Exec(client, params)
 		if err != nil {
@@ -95,6 +109,7 @@ func (p *protocolV2) IOLoop(c protocol.Client) error {
 			p.nsqd.logf(LOG_ERROR, "[%s] - %s%s", client, err, ctx)
 
 			sendErr := p.Send(client, frameTypeError, []byte(err.Error()))
+			endPub()
 			if sendErr != nil {
 				p.nsqd.logf(LOG_ERROR, "[%s] - %s%s", client, sendErr, ctx)
 				break
@@ -109,10 +124,13 @@ func (p *protocolV2) IOLoop(c protocol.Client) error {
 
 		if response != nil {
 			err = p.Send(client, frameTypeResponse, response)
+			endPub()
 			if err != nil {
 				err = fmt.Errorf("failed to send response - %s", err)
 				break
 			}
+		} else {
+			endPub()
 		}
 	}
 
@@ -173,6 +191,17 @@ func (p *protocolV2) Send(client *clientV2, frameType int32, data []byte) error 
 	client.writeLock.Unlock()
 
 	return err
+}
+
+// isPubCommand returns true for the commands that publish messages
+// (PUB, MPUB, DPUB)
+func isPubCommand(params [][]byte) bool {
+	if len(params) == 0 {
+		return false
+	}
+	return bytes.Equal(params[0], []byte("PUB")) ||
+		bytes.Equal(params[0], []byte("MPUB")) ||
+		bytes.Equal(params[0], []byte("DPUB"))
 }
 
 func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
@@ -848,6 +877,13 @@ func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
 		return nil, err
 	}
 
+	// the message body has been consumed, so it is safe to reject the
+	// publish explicitly when this node is offloading itself
+	if p.nsqd.IsDraining() {
+		return nil, protocol.NewClientErr(nil, "E_DRAINING",
+			"node is draining, not accepting publishes")
+	}
+
 	topic := p.nsqd.GetTopic(topicName)
 	msg := NewMessage(topic.GenerateID(), messageBody)
 	err = topic.PutMessage(msg)
@@ -898,6 +934,13 @@ func (p *protocolV2) MPUB(client *clientV2, params [][]byte) ([]byte, error) {
 		p.nsqd.getOpts().MaxMsgSize, p.nsqd.getOpts().MaxBodySize)
 	if err != nil {
 		return nil, err
+	}
+
+	// the message bodies have been consumed, so it is safe to reject the
+	// publish explicitly when this node is offloading itself
+	if p.nsqd.IsDraining() {
+		return nil, protocol.NewClientErr(nil, "E_DRAINING",
+			"node is draining, not accepting publishes")
 	}
 
 	// if we've made it this far we've validated all the input,
@@ -962,6 +1005,13 @@ func (p *protocolV2) DPUB(client *clientV2, params [][]byte) ([]byte, error) {
 
 	if err := p.CheckAuth(client, "DPUB", topicName, ""); err != nil {
 		return nil, err
+	}
+
+	// the message body has been consumed, so it is safe to reject the
+	// publish explicitly when this node is offloading itself
+	if p.nsqd.IsDraining() {
+		return nil, protocol.NewClientErr(nil, "E_DRAINING",
+			"node is draining, not accepting publishes")
 	}
 
 	topic := p.nsqd.GetTopic(topicName)

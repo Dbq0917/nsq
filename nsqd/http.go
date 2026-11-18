@@ -232,6 +232,10 @@ func (s *httpServer) doPUB(w http.ResponseWriter, req *http.Request, ps httprout
 		return nil, http_api.Err{Code: 400, Text: "MSG_EMPTY"}
 	}
 
+	if s.nsqd.IsDraining() {
+		return nil, http_api.Err{Code: 503, Text: "DRAINING"}
+	}
+
 	reqParams, topic, err := s.getTopicFromQuery(req)
 	if err != nil {
 		return nil, err
@@ -328,6 +332,10 @@ func (s *httpServer) doMPUB(w http.ResponseWriter, req *http.Request, ps httprou
 			msg := NewMessage(topic.GenerateID(), block)
 			msgs = append(msgs, msg)
 		}
+	}
+
+	if s.nsqd.IsDraining() {
+		return nil, http_api.Err{Code: 503, Text: "DRAINING"}
 	}
 
 	err = topic.PutMessages(msgs)

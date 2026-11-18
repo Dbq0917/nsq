@@ -72,7 +72,20 @@ type NSQD struct {
 	waitGroup            util.WaitGroupWrapper
 
 	ci *clusterinfo.ClusterInfo
+
+	// drain state, coordinated by drainMu, used to gracefully offload
+	// this node from the cluster before tearing down connections
+	drainMu           sync.Mutex
+	draining          bool
+	inFlightPubs      int64
+	lastPubAttempt    time.Time
+	lookupLoopRunning int32
 }
+
+// drainQuietPeriod is the amount of time without any publish attempt
+// (accepted or rejected) after which a draining node considers producer
+// traffic to have moved elsewhere and completes its drain window
+const drainQuietPeriod = 100 * time.Millisecond
 
 func New(opts *Options) (*NSQD, error) {
 	var err error
@@ -235,6 +248,98 @@ func (n *NSQD) SetHealth(err error) {
 
 func (n *NSQD) IsHealthy() bool {
 	return n.GetError() == nil
+}
+
+// IsDraining returns true once the node has begun its graceful offload
+// and is no longer accepting new publishes
+func (n *NSQD) IsDraining() bool {
+	n.drainMu.Lock()
+	defer n.drainMu.Unlock()
+	return n.draining
+}
+
+// beginPub marks the start of a publish command. It returns false when
+// the node is draining and the publish must be rejected. Every call that
+// returns true must be paired with endPub.
+func (n *NSQD) beginPub() bool {
+	n.drainMu.Lock()
+	defer n.drainMu.Unlock()
+	n.lastPubAttempt = time.Now()
+	if n.draining {
+		return false
+	}
+	n.inFlightPubs++
+	return true
+}
+
+// endPub marks the completion of a publish command (its response has
+// been flushed to the client)
+func (n *NSQD) endPub() {
+	n.drainMu.Lock()
+	n.inFlightPubs--
+	n.drainMu.Unlock()
+}
+
+// drain performs the graceful offload ("下线通知") of this node:
+//
+//  1. it flips the node into draining state so new publishes are
+//     rejected explicitly (clients can immediately retry other nodes)
+//  2. it unregisters all topics from nsqlookupd so producers refreshing
+//     their topology view stop selecting this node
+//  3. it waits for in-flight publishes to be acknowledged and for
+//     producer traffic to quiesce
+//
+// The window is adaptive: it lasts at least DrainMinWait (the
+// notification period, giving stale topology views time to refresh), it
+// extends while publishes are still in-flight or being attempted, and it
+// never exceeds DrainMaxWait so that node removal cannot stall.
+func (n *NSQD) drain() {
+	n.drainMu.Lock()
+	n.draining = true
+	n.drainMu.Unlock()
+
+	opts := n.getOpts()
+	maxWait := opts.DrainMaxWait
+	start := time.Now()
+	deadline := start.Add(maxWait)
+
+	// announce the departure to nsqlookupd before waiting so that the
+	// notification period and the lookup propagation overlap
+	if atomic.LoadInt32(&n.lookupLoopRunning) == 1 {
+		done := make(chan struct{})
+		n.Notify(drainNotification{done: done}, false)
+		select {
+		case <-done:
+		case <-time.After(maxWait):
+			n.logf(LOG_WARN, "NSQ: timed out unregistering topics from nsqlookupd")
+		}
+	}
+
+	minWait := opts.DrainMinWait
+	for {
+		n.drainMu.Lock()
+		inFlight := n.inFlightPubs
+		lastAttempt := n.lastPubAttempt
+		n.drainMu.Unlock()
+
+		now := time.Now()
+		elapsed := now.Sub(start)
+		quiesced := lastAttempt.IsZero() || now.Sub(lastAttempt) >= drainQuietPeriod
+		if inFlight == 0 && elapsed >= minWait && quiesced {
+			break
+		}
+		remaining := deadline.Sub(now)
+		if remaining <= 0 {
+			n.logf(LOG_WARN, "NSQ: drain window exceeded with %d in-flight pubs", inFlight)
+			break
+		}
+		sleep := 5 * time.Millisecond
+		if remaining < sleep {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
+	}
+	n.logf(LOG_INFO, "NSQ: drain complete in %s", time.Since(start))
 }
 
 func (n *NSQD) GetError() error {
@@ -451,6 +556,12 @@ func (n *NSQD) Exit() {
 		// avoid double call
 		return
 	}
+
+	// gracefully offload this node: stop accepting new publishes,
+	// announce the departure to nsqlookupd, and wait for in-flight
+	// publishes to be acknowledged before tearing anything down
+	n.drain()
+
 	if n.tcpListener != nil {
 		_ = n.tcpListener.Close()
 	}
