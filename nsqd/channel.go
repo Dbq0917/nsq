@@ -61,6 +61,7 @@ type Channel struct {
 	// state tracking
 	clients        map[int64]Consumer
 	paused         int32
+	pausedAt       int64
 	ephemeral      bool
 	deleteCallback func(*Channel)
 	deleter        sync.Once
@@ -301,9 +302,13 @@ func (c *Channel) UnPause() error {
 
 func (c *Channel) doPause(pause bool) error {
 	if pause {
-		atomic.StoreInt32(&c.paused, 1)
+		if atomic.CompareAndSwapInt32(&c.paused, 0, 1) {
+			atomic.StoreInt64(&c.pausedAt, time.Now().UnixNano())
+		}
 	} else {
-		atomic.StoreInt32(&c.paused, 0)
+		if atomic.CompareAndSwapInt32(&c.paused, 1, 0) {
+			c.deferPausedMessages()
+		}
 	}
 
 	c.RLock()
@@ -320,6 +325,42 @@ func (c *Channel) doPause(pause bool) error {
 
 func (c *Channel) IsPaused() bool {
 	return atomic.LoadInt32(&c.paused) == 1
+}
+
+// DeferredCount returns the number of messages currently waiting in the
+// deferred priority queue (including messages whose original deadline has
+// already passed while the channel is paused).
+func (c *Channel) DeferredCount() int {
+	c.deferredMutex.Lock()
+	n := len(c.deferredMessages)
+	c.deferredMutex.Unlock()
+	return n
+}
+
+// deferPausedMessages reschedules the deferred messages that became due while
+// the channel was paused. Their deadlines are shifted by the pause duration so
+// that they are released spread out over time after resume instead of being
+// delivered in a single burst. Messages not yet due keep their original
+// deadline.
+func (c *Channel) deferPausedMessages() {
+	pausedAt := atomic.SwapInt64(&c.pausedAt, 0)
+	if pausedAt == 0 {
+		return
+	}
+	resumedAt := time.Now().UnixNano()
+	pauseDuration := resumedAt - pausedAt
+	if pauseDuration <= 0 {
+		return
+	}
+
+	c.deferredMutex.Lock()
+	for _, item := range c.deferredMessages {
+		if item.Priority <= resumedAt {
+			item.Priority += pauseDuration
+			heap.Fix(&c.deferredPQ, item.Index)
+		}
+	}
+	c.deferredMutex.Unlock()
 }
 
 // PutMessage writes a Message to the queue
@@ -625,6 +666,15 @@ func (c *Channel) processDeferredQueue(t int64) bool {
 	defer c.exitMutex.RUnlock()
 
 	if c.Exiting() {
+		return false
+	}
+
+	// While paused, deferred messages stay in the priority queue even after
+	// their deadline passes. They are rescheduled on resume (see
+	// deferPausedMessages) so they don't pile up in the ready queue and burst
+	// downstream. Returning "not dirty" also keeps the queue scan loop from
+	// busy-spinning for the whole pause window.
+	if c.IsPaused() {
 		return false
 	}
 

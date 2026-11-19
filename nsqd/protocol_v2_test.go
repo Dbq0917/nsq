@@ -699,6 +699,110 @@ func TestDPUB(t *testing.T) {
 	test.Equal(t, "E_INVALID DPUB defer timeout 3600100 out of range 0-3600000", string(data))
 }
 
+// TestPausingDeferredSmoothsDelivery verifies that deferred messages whose
+// deadlines pass while a channel is paused do not pile up in the ready queue
+// and burst out on resume: they stay deferred, remain visible in the stats, and
+// are released spread over time after the channel is unpaused.
+func TestPausingDeferredSmoothsDelivery(t *testing.T) {
+	const numMessages = 6
+
+	topicName := "test_pause_defer_v2" + strconv.Itoa(int(time.Now().Unix()))
+
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.LogLevel = LOG_DEBUG
+	tcpAddr, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	conn, err := mustConnectNSQD(tcpAddr)
+	test.Nil(t, err)
+	defer func() { _ = conn.Close() }()
+
+	identify(t, conn, nil, frameTypeResponse)
+	sub(t, conn, topicName, "ch")
+
+	topic := nsqd.GetTopic(topicName)
+	channel := topic.GetChannel("ch")
+
+	// deferred messages, each with a slightly longer defer so their deadlines
+	// land at different points inside the pause window
+	for i := 0; i < numMessages; i++ {
+		msg := NewMessage(topic.GenerateID(), []byte("test"))
+		channel.PutMessageDeferred(msg, time.Duration(50+i*25)*time.Millisecond)
+	}
+
+	// pause before any deadline, simulating a downstream maintenance window
+	err = channel.Pause()
+	test.Nil(t, err)
+
+	// all deadlines (max ~175ms) pass while paused
+	time.Sleep(400 * time.Millisecond)
+
+	// nothing must have leaked into the ready queue, everything stays deferred
+	test.Equal(t, 0, len(channel.memoryMsgChan))
+	test.Equal(t, numMessages, channel.DeferredCount())
+
+	stats := NewChannelStats(channel, nil, 0)
+	test.Equal(t, numMessages, stats.DeferredCount)
+	test.Equal(t, true, stats.Paused)
+
+	// now allow the client to receive messages
+	_, err = nsq.Ready(numMessages).WriteTo(conn)
+	test.Nil(t, err)
+	time.Sleep(50 * time.Millisecond)
+
+	resumeAt := time.Now()
+	err = channel.UnPause()
+	test.Nil(t, err)
+
+	deliveredInFirstWindow := int32(0)
+	var firstDeliveryAt time.Time
+	var mu sync.Mutex
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		for i := 0; i < numMessages; i++ {
+			conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			resp, err := nsq.ReadResponse(conn)
+			if err != nil {
+				return
+			}
+			frameType, data, err := nsq.UnpackResponse(resp)
+			if err != nil || frameType != frameTypeMessage {
+				continue
+			}
+			msg, _ := decodeMessage(data)
+			_, _ = nsq.Finish(nsq.MessageID(msg.ID)).WriteTo(conn)
+
+			mu.Lock()
+			if firstDeliveryAt.IsZero() {
+				firstDeliveryAt = time.Now()
+			}
+			mu.Unlock()
+			atomic.AddInt32(&deliveredInFirstWindow, 1)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(12 * time.Second):
+		t.Fatal("timed out waiting for deferred messages to drain")
+	}
+
+	test.Equal(t, int32(numMessages), atomic.LoadInt32(&deliveredInFirstWindow))
+
+	// every deadline was shifted forward by the pause duration (~450ms), so the
+	// first delivery must be well after resume rather than instant at resume
+	mu.Lock()
+	latencyToFirst := firstDeliveryAt.Sub(resumeAt)
+	mu.Unlock()
+	if latencyToFirst < 200*time.Millisecond {
+		t.Fatalf("expected smoothed delivery, first message arrived %s after resume", latencyToFirst)
+	}
+}
+
 func TestTouch(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -105,6 +106,141 @@ func TestInFlightWorker(t *testing.T) {
 	inFlightPQMsgs = len(channel.inFlightPQ)
 	channel.inFlightMutex.Unlock()
 	test.Equal(t, 0, inFlightPQMsgs)
+}
+
+func TestDeferredQueuePaused(t *testing.T) {
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	_, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	topicName := "test_deferred_paused" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channel := topic.GetChannel("channel")
+
+	err := channel.Pause()
+	test.Nil(t, err)
+
+	msg := NewMessage(topic.GenerateID(), []byte("test"))
+	err = channel.StartDeferredTimeout(msg, 50*time.Millisecond)
+	test.Nil(t, err)
+
+	// well after the deadline, the message must stay in the deferred queue
+	// instead of being moved to the ready queue while paused
+	time.Sleep(300 * time.Millisecond)
+
+	test.Equal(t, 1, channel.DeferredCount())
+	test.Equal(t, 0, len(channel.memoryMsgChan))
+	test.Equal(t, int64(0), channel.Depth())
+
+	// the scan worker must not report the channel dirty while paused
+	now := time.Now().UnixNano()
+	test.Equal(t, false, channel.processDeferredQueue(now))
+
+	err = channel.UnPause()
+	test.Nil(t, err)
+
+	// after resume the deadline was shifted by the pause duration, so the
+	// message is still deferred (not released instantly in a burst)
+	test.Equal(t, 1, channel.DeferredCount())
+	test.Equal(t, 0, len(channel.memoryMsgChan))
+
+	channel.deferredMutex.Lock()
+	item := channel.deferredPQ[0]
+	channel.deferredMutex.Unlock()
+	test.Equal(t, true, item.Priority > now)
+}
+
+func TestDeferredQueueResumeReschedule(t *testing.T) {
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	_, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	topicName := "test_deferred_resume" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channel := topic.GetChannel("channel")
+
+	err := channel.Pause()
+	test.Nil(t, err)
+
+	// a message that becomes due during the pause
+	dueMsg := NewMessage(topic.GenerateID(), []byte("due"))
+	err = channel.StartDeferredTimeout(dueMsg, 30*time.Millisecond)
+	test.Nil(t, err)
+
+	// a message whose deadline stays in the future across the pause
+	futureMsg := NewMessage(topic.GenerateID(), []byte("future"))
+	err = channel.StartDeferredTimeout(futureMsg, 10*time.Second)
+	test.Nil(t, err)
+
+	time.Sleep(150 * time.Millisecond)
+
+	pausedAt := atomic.LoadInt64(&channel.pausedAt)
+
+	channel.deferredMutex.Lock()
+	originalFuturePriority := channel.deferredMessages[futureMsg.ID].Priority
+	channel.deferredMutex.Unlock()
+
+	err = channel.UnPause()
+	test.Nil(t, err)
+
+	resumeAt := time.Now().UnixNano()
+
+	channel.deferredMutex.Lock()
+	dueItem := channel.deferredMessages[dueMsg.ID]
+	futureItem := channel.deferredMessages[futureMsg.ID]
+	duePriority := dueItem.Priority
+	futurePriority := futureItem.Priority
+	channel.deferredMutex.Unlock()
+
+	// the due message gets pushed out by roughly the pause duration
+	test.Equal(t, true, duePriority >= resumeAt)
+	test.Equal(t, true, duePriority-pausedAt > int64(100*time.Millisecond))
+
+	// the not-yet-due message keeps its original (unshifted) deadline
+	test.Equal(t, originalFuturePriority, futurePriority)
+	test.Equal(t, true, futurePriority > duePriority)
+
+	// the heap still orders by priority
+	channel.deferredMutex.Lock()
+	minPriority := channel.deferredPQ[0].Priority
+	channel.deferredMutex.Unlock()
+	test.Equal(t, duePriority, minPriority)
+}
+
+func TestDeferredQueuePauseKeepsBacklogVisible(t *testing.T) {
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	_, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	topicName := "test_deferred_backlog" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channel := topic.GetChannel("channel")
+
+	err := channel.Pause()
+	test.Nil(t, err)
+
+	for i := 0; i < 5; i++ {
+		msg := NewMessage(topic.GenerateID(), []byte("test"))
+		err = channel.StartDeferredTimeout(msg, 25*time.Millisecond)
+		test.Nil(t, err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	stats := NewChannelStats(channel, nil, 0)
+	test.Equal(t, 5, stats.DeferredCount)
+	test.Equal(t, true, stats.Paused)
+	test.Equal(t, 5, channel.DeferredCount())
+
+	err = channel.UnPause()
+	test.Nil(t, err)
+	test.Equal(t, 5, channel.DeferredCount())
 }
 
 func TestChannelEmpty(t *testing.T) {
